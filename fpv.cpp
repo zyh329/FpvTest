@@ -1,37 +1,18 @@
-//	Copyright (c) 2013, Michal Ulianko
-//	All rights reserved.
-//
-//	Redistribution and use in source and binary forms, with or without
-//	modification, are permitted provided that the following conditions are met:
-//
-//	1. Redistributions of source code must retain the above copyright notice, this
-//	   list of conditions and the following disclaimer.
-//	2. Redistributions in binary form must reproduce the above copyright notice,
-//	   this list of conditions and the following disclaimer in the documentation
-//	   and/or other materials provided with the distribution.
-//
-//	THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-//	ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-//	WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-//	DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
-//	ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-//	(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-//	LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-//	ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-//	(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-//	SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
 #include "fpv.h"
 #include <QDebug>
+#include "mavlink/common/mavlink.h"
+
+#define DEG(x) (x*180/M_PI)
 
 Fpv::Fpv(QWidget *parent)
 	: QWidget(parent), retryCount(0), retryEnable(true)
 {
 	socket = new QUdpSocket(this);
-	socket->bind(QHostAddress::Any, 12345);
+	socket->bind(QHostAddress::Any, 14560);
 	connect(socket, SIGNAL(readyRead()), this, SLOT(readDatagrams()));
 
-	setFixedSize(1024, 768);
+	setFixedSize(1296, 730);
+	//setFixedSize(640*2, 480*2);
 	setContentsMargins(0, 0, 0, 0);
 
 	videoWidget = new QGst::Ui::VideoWidget;
@@ -43,7 +24,8 @@ Fpv::Fpv(QWidget *parent)
 	setLayout(layout);
 
 	hud = new Hud(this);
-	hud->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::MinimumExpanding);
+	//hud->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::MinimumExpanding);
+	hud->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 
 	retryTimer = new QTimer(this);
 	retryTimer->setSingleShot(true);
@@ -58,11 +40,29 @@ Fpv::~Fpv()
 
 void Fpv::readDatagrams()
 {
-	float q[4];
 	while (socket->hasPendingDatagrams()) {
-		socket->readDatagram(reinterpret_cast<char *>(q), 16);
-		hud->setAH(q[0], q[1], q[2], q[3]);
-		qDebug() << q[0] << endl;
+		QByteArray datagram;
+		datagram.resize(socket->pendingDatagramSize());
+		socket->readDatagram(datagram.data(), datagram.size());
+
+		mavlink_message_t msg;
+		mavlink_status_t status;
+		mavlink_attitude_t attitude;
+
+		for (int i = 0; i < datagram.size(); ++i) {
+			if (mavlink_parse_char(MAVLINK_COMM_0, datagram.data()[i], &msg, &status)) {
+				switch (msg.msgid) {
+				case MAVLINK_MSG_ID_ATTITUDE:
+					mavlink_msg_attitude_decode(&msg, &attitude);
+					//qDebug() << "pitch:" << attitude.pitch << "roll:" << attitude.roll << "yaw:" << attitude.yaw;
+					hud->setEulers(DEG(attitude.yaw), DEG(attitude.pitch), DEG(attitude.roll));
+					break;
+				default:
+					break;
+				}
+			}
+		}
+
 	}
 }
 
@@ -71,24 +71,25 @@ void Fpv::startFpv()
 	stopFpv();
 	pipeline = QGst::Pipeline::create();
 
-	QGst::ElementPtr rtpbin = QGst::ElementFactory::make("gstrtpbin");
-    if (!rtpbin) {
-        qCritical("Failed to create gstrtpbin");
-        return;
-    }
-    rtpbin->setProperty("latency", 5);
-    pipeline->add(rtpbin);
+	QGst::ElementPtr rtpbin = QGst::ElementFactory::make("rtpbin");
+	if (!rtpbin) {
+		qFatal("Failed to create gstrtpbin");
+	}
+	rtpbin->setProperty("latency", 60);
+	rtpbin->setProperty("drop-on-latency", true);
+	pipeline->add(rtpbin);
 
-	QGst::ElementPtr rtpUdpSrc = QGst::ElementFactory::make("udpsrc");
-	if (!rtpUdpSrc) {
+	QGst::ElementPtr rtpudpsrc = QGst::ElementFactory::make("udpsrc");
+	if (!rtpudpsrc) {
 		qFatal("Failed to create udpsrc. Aborting...");
 	}
-	rtpUdpSrc->setProperty("port", 5000);
-	rtpUdpSrc->setProperty("caps", QGst::Caps::fromString("application/x-rtp,"
-			"media=(string)video,"
-			"clock-rate=(int)90000"));
-	pipeline->add(rtpUdpSrc);
-	rtpUdpSrc->link(rtpbin, "recv_rtp_sink_0");
+	rtpudpsrc->setProperty("port", 5000);
+	rtpudpsrc->setProperty("caps", QGst::Caps::fromString("application/x-rtp,"
+														  "media=(string)video,"
+														  "clock-rate=(int)90000,"
+														  "encoding-name=(string)H264"));
+	pipeline->add(rtpudpsrc);
+	rtpudpsrc->link(rtpbin, "recv_rtp_sink_0");
 
 	QGst::ElementPtr rtcpudpsrc = QGst::ElementFactory::make("udpsrc");
 	rtcpudpsrc->setProperty("port", 5001);
@@ -96,15 +97,16 @@ void Fpv::startFpv()
 	rtcpudpsrc->link(rtpbin, "recv_rtcp_sink_0");
 
 	QGst::ElementPtr rtcpudpsink = QGst::ElementFactory::make("udpsink");
-	//rtcpudpsink->setProperty("host", "127.0.0.1");
-	rtcpudpsink->setProperty("host", "192.168.3.1");
+	rtcpudpsink->setProperty("host", "192.168.13.1");
+//	rtcpudpsink->setProperty("host", "127.0.0.1");
 	rtcpudpsink->setProperty("port", 5005);
 	rtcpudpsink->setProperty("sync", false);
 	rtcpudpsink->setProperty("async", false);
 	pipeline->add(rtcpudpsink);
 	rtpbin->link("send_rtcp_src_0", rtcpudpsink);
 
-	output = QGst::ElementFactory::make("qwidgetvideosink");
+	output = QGst::ElementFactory::make("qwidget5videosink");
+	output->setProperty("sync", false);
 	videoWidget->setVideoSink(output);
 	pipeline->add(output);
 
@@ -138,9 +140,10 @@ void Fpv::onRtpBinPadAdded(const QGst::PadPtr & pad)
 	QGst::ElementPtr bin;
 
 	try {
-		if (pad->caps()->internalStructure(0)->value("media").toString() == QLatin1String("video")) {
+		if (pad->name().startsWith(QLatin1String("recv_rtp_src_0"))) {
 			bin = QGst::Bin::fromDescription(
-					"rtpjpegdepay ! jpegdec ! ffmpegcolorspace");
+					"rtph264depay ! avdec_h264 ! queue leaky=2 ! videoconvert");
+			qDebug() << "added";
 		}
 	} catch (const QGlib::Error & error) {
 		qCritical() << error;
@@ -149,9 +152,9 @@ void Fpv::onRtpBinPadAdded(const QGst::PadPtr & pad)
 
 	pipeline->add(bin);
 	bin->syncStateWithParent();
-	output->syncStateWithParent();
-
 	pad->link(bin->getStaticPad("sink"));
+
+	output->syncStateWithParent();
 	bin->getStaticPad("src")->link(output->getStaticPad("sink"));
 }
 
@@ -161,6 +164,11 @@ void Fpv::onBusErrorMessage(const QGst::MessagePtr & msg)
 	stopFpv();
 	//TODO Restart only when the errror is "Internal data flow error".
 	retryTimer->start(500);
+}
+
+void Fpv::lala()
+{
+
 }
 
 void Fpv::resizeEvent(QResizeEvent *event)
